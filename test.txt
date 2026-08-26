@@ -1,0 +1,45 @@
+Create a file at docs/architecture/inference-service.md documenting our 
+SLM inferencing-as-a-service platform, including a Mermaid diagram.
+
+Architecture to document:
+
+- 5-node Kubernetes cluster, each node: 48 physical cores / 350GB RAM 
+  (hyper-threaded to 96 logical threads, but static CPU Manager pins 
+  pods to physical cores only)
+- Clients (OpenAI SDK / curl) send requests over HTTPS through an 
+  Ingress/LoadBalancer to an inference-router service
+- inference-router = LiteLLM proxy (2 replicas), exposes an 
+  OpenAI-compatible API (/v1/chat/completions), handles virtual-key 
+  auth, rate limiting, and least-busy routing across model replicas
+- Router fans out to per-model Kubernetes Services (e.g. 
+  model-llama-8b-svc, model-phi-3-svc), each backed by a Deployment 
+  running the llama.cpp server (GGUF quantized weights, continuous 
+  batching)
+- Each model Deployment runs 2+ replicas spread across different 
+  physical nodes via podAntiAffinity for HA; nodeSelector pins each 
+  model to nodes labeled for it
+- Each model pod is Guaranteed QoS (CPU/memory requests == limits) so 
+  static CPU Manager gives it exclusive pinned cores; Topology Manager 
+  keeps CPU+memory on the same NUMA node
+- Model weights live in a MinIO/S3-compatible store; an initContainer 
+  pulls weights once per pod and caches them on local NVMe 
+  (hostPath or local PersistentVolume)
+- Observability: Prometheus scrapes per-pod latency/queue-depth/
+  tokens-per-second; Grafana dashboards on top; prometheus-adapter 
+  feeds a custom-metrics HPA (queue depth, not raw CPU%)
+
+Structure the markdown as:
+1. A one-paragraph overview
+2. A Mermaid flowchart (graph TD) showing: Client → Ingress → 
+   inference-router (LiteLLM) → per-model Services → per-model pods 
+   on specific nodes → shared MinIO weight store (as a side node feeding 
+   the pods) → Prometheus/Grafana (as a side node observing the pods)
+3. A short "Request flow" section describing the path of a single 
+   chat completion request end to end
+4. A table of components: Layer | Technology | Purpose
+5. A "Known gaps" section listing: auth enforcement not yet applied, 
+   HPA on custom metrics not yet built, PodDisruptionBudget per model 
+   not yet built
+
+Use valid GitHub-flavored Mermaid syntax so it renders in GitHub's 
+markdown preview.
