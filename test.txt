@@ -1,56 +1,9 @@
-Create a file at docs/architecture/inference-service.md documenting our 
-SLM inferencing-as-a-service platform, including a Mermaid diagram.
-
-Architecture to document:
-
-- 5-node Kubernetes cluster, each node: 48 physical cores / 350GB RAM 
-  (hyper-threaded to 96 logical threads, but static CPU Manager pins 
-  pods to physical cores only)
-- Clients (OpenAI SDK / curl) send requests over HTTPS through an 
-  Ingress/LoadBalancer to an inference-router service
-- inference-router = LiteLLM proxy (2 replicas), exposes an 
-  OpenAI-compatible API (/v1/chat/completions), handles virtual-key 
-  auth, rate limiting, and least-busy routing across model replicas
-- Router fans out to per-model Kubernetes Services (e.g. 
-  model-llama-8b-svc, model-phi-3-svc), each backed by a Deployment 
-  running the llama.cpp server (GGUF quantized weights, continuous 
-  batching)
-- Each model Deployment runs 2+ replicas spread across different 
-  physical nodes via podAntiAffinity for HA; nodeSelector pins each 
-  model to nodes labeled for it
-- Each model pod is Guaranteed QoS (CPU/memory requests == limits) so 
-  static CPU Manager gives it exclusive pinned cores; Topology Manager 
-  keeps CPU+memory on the same NUMA node
-- Model weights live in a MinIO/S3-compatible store; an initContainer 
-  pulls weights once per pod and caches them on local NVMe 
-  (hostPath or local PersistentVolume)
-- Observability: Prometheus scrapes per-pod latency/queue-depth/
-  tokens-per-second; Grafana dashboards on top; prometheus-adapter 
-  feeds a custom-metrics HPA (queue depth, not raw CPU%)
-
-Structure the markdown as:
-1. A one-paragraph overview
-2. A Mermaid flowchart (graph TD) showing: Client → Ingress → 
-   inference-router (LiteLLM) → per-model Services → per-model pods 
-   on specific nodes → shared MinIO weight store (as a side node feeding 
-   the pods) → Prometheus/Grafana (as a side node observing the pods)
-3. A short "Request flow" section describing the path of a single 
-   chat completion request end to end
-4. A table of components: Layer | Technology | Purpose
-5. A "Known gaps" section listing: auth enforcement not yet applied, 
-   HPA on custom metrics not yet built, PodDisruptionBudget per model 
-   not yet built
-
-Use valid GitHub-flavored Mermaid syntax so it renders in GitHub's 
-markdown preview.
-
-
-
-
-
-
 Build out a Kubernetes-based SLM inferencing-as-a-service platform in 
 this repo. Set up the following structure and implement each piece.
+
+IMPORTANT — SCOPE: Only create files in this repo. Do NOT run kubectl 
+apply, helm install, or any command that touches a live cluster. I 
+will run the actual deployment myself once the files are ready.
 
 CONTEXT:
 - Target cluster: 5 nodes, each 48 physical cores / 350GB RAM 
@@ -132,23 +85,41 @@ model ensuring at least 1 replica stays up during voluntary
 disruptions (node drains, upgrades).
 
 TASK 6 — Observability
-Deploy Prometheus + Grafana + prometheus-adapter in the monitoring 
-namespace (assume Prometheus Operator available). Add ServiceMonitor 
-resources scraping each model pod's /metrics endpoint (latency, queue 
-depth, tokens/sec) across both inference-staging and 
+Write manifests to deploy Prometheus + Grafana + prometheus-adapter in 
+the monitoring namespace (assume Prometheus Operator available). Add 
+ServiceMonitor resources scraping each model pod's /metrics endpoint 
+(latency, queue depth, tokens/sec) across both inference-staging and 
 inference-production. Add a starter Grafana dashboard JSON under 
 /docs/architecture/dashboards/ that can filter by namespace/environment.
 
-TASK 7 — Docs
+TASK 7 — Architecture docs
 Write /docs/architecture/inference-service.md with a Mermaid diagram 
 of the full request path (Client → Ingress → LiteLLM router → per-
 model Services → pods on labeled nodes, with MinIO weight store in 
 platform-storage and Prometheus/Grafana in monitoring as side 
 systems), a namespace/component table (Namespace | Contains | 
-Purpose), and a "known gaps" section you update as you close items 
-above.
+Purpose), and a "known gaps" section.
 
-Work through the tasks in order. After each task, run kubectl 
---dry-run=client -o yaml against new manifests to validate them before 
-moving on, and stop to ask me before applying anything to a real 
-cluster context.
+TASK 8 — Runbook (setup instructions)
+Write /docs/RUNBOOK.md with the exact, ordered steps to bring this 
+whole thing up from nothing, written for someone running kubectl by 
+hand. Include:
+  - Prerequisites (kubectl access, Trident CSI + ontap-iscsi/ontap-nas 
+    StorageClasses already installed, Prometheus Operator CRDs 
+    installed, node hardware prepped per Task 1)
+  - Step-by-step commands in the correct order: create namespaces → 
+    run prep-node.sh against each of the 5 nodes → apply platform-storage 
+    (MinIO) → verify MinIO is up and create the weights bucket → upload 
+    a first model's GGUF file → apply monitoring stack → apply the 
+    staging overlay (kustomize build | kubectl apply) → verify model 
+    pods reach Ready → apply the router → generate a virtual API key → 
+    send a test curl request end to end → repeat for production
+  - For each step: the exact command, what output/status indicates 
+    success, and the most likely failure mode with how to check it 
+    (e.g. pod stuck in Init if the MinIO bucket/weights aren't there yet)
+  - A "tear down" section at the end with the reverse order for safely 
+    removing everything
+
+Work through the tasks in order, writing files only — no cluster 
+commands. When finished, summarize what was created and point me to 
+/docs/RUNBOOK.md as the starting point.
