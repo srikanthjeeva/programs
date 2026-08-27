@@ -43,3 +43,112 @@ Structure the markdown as:
 
 Use valid GitHub-flavored Mermaid syntax so it renders in GitHub's 
 markdown preview.
+
+
+
+
+
+
+Build out a Kubernetes-based SLM inferencing-as-a-service platform in 
+this repo. Set up the following structure and implement each piece.
+
+CONTEXT:
+- Target cluster: 5 nodes, each 48 physical cores / 350GB RAM 
+  (hyper-threaded to 96 logical threads — plan CPU allocation around 
+  physical cores only, not logical threads)
+- Models are small language models (SLMs), CPU-only inference, served 
+  via llama.cpp server using GGUF quantized weights
+- Client-facing API must be OpenAI-compatible (/v1/chat/completions)
+- Storage backend: NetApp ONTAP via Trident CSI (ontap-iscsi and 
+  ontap-nas storage classes available)
+
+REPO STRUCTURE (single repo):
+  /k8s/base/                — base manifests (kustomize base)
+  /k8s/overlays/staging/    — staging overlay
+  /k8s/overlays/production/ — production overlay
+  /docs/architecture/       — architecture docs + diagrams
+  /scripts/                 — helper scripts (model onboarding, node prep)
+
+NAMESPACES:
+  inference-staging      — model deployments, router, staging-specific resources
+  inference-production   — model deployments, router, production-specific resources
+  platform-storage       — shared MinIO weight store, used by BOTH staging and 
+                            production (assumption — if we want isolated weight 
+                            stores per environment instead, move MinIO into each 
+                            inference-* namespace and drop platform-storage; note 
+                            this as a documented tradeoff in the architecture doc, 
+                            don't just silently pick one)
+  monitoring              — Prometheus, Grafana, prometheus-adapter (cluster-wide, 
+                            watches both inference-* namespaces via ServiceMonitor 
+                            namespace selectors)
+
+Apply ResourceQuota and NetworkPolicy per inference-* namespace so 
+staging load testing can't starve production of CPU/memory or reach 
+its pods.
+
+TASK 1 — Node prep automation
+Write a script (/scripts/prep-node.sh) that, for a given node, verifies 
+kubelet has cpuManagerPolicy: static and topologyManagerPolicy: 
+single-numa-node set, and labels the node for a given model family. 
+Fail loudly with clear output if the kubelet config is wrong, rather 
+than silently proceeding.
+
+TASK 2 — Weight store (MinIO on ONTAP iSCSI)
+Deploy MinIO as a single-replica StatefulSet in platform-storage, 
+backed by a PVC using the ontap-iscsi StorageClass (ReadWriteOnce — 
+this is correct and expected, only the MinIO pod touches this volume; 
+do not attempt ReadWriteMany here). Expose it as a ClusterIP Service 
+reachable from both inference-staging and inference-production via 
+its S3 API. Document in /docs/architecture/weight-store.md why iSCSI 
+(block storage) is right for MinIO's own backing store, in contrast 
+to NFS which is not recommended for MinIO's data volumes.
+
+TASK 3 — Per-model Deployment template
+Create a kustomize base for a model deployment (llama.cpp server) 
+with: Guaranteed QoS (cpu/memory requests == limits), nodeSelector 
+keyed to model/<name>=true, podAntiAffinity across replicas by 
+hostname, an initContainer that pulls GGUF weights from the MinIO S3 
+endpoint into a local NVMe-backed volume (cache-if-present, don't 
+re-pull), readiness/liveness probes that hit a real inference 
+endpoint (not just TCP), and a matching ClusterIP Service. Parameterize 
+model name, core count, memory, and weight path so new models are 
+added by copying the overlay and changing a few values — document that 
+workflow in /docs/architecture/adding-a-model.md.
+
+TASK 4 — Router
+Deploy a LiteLLM proxy (2 replicas) per environment as the API 
+gateway: OpenAI-compatible surface, least-busy routing across model 
+replicas, a ConfigMap-driven model_list so new models register without 
+code changes, and virtual-key auth via general_settings.master_key 
+(pull the master key from a K8s Secret, never hardcode it). Add a 
+script to generate/rotate virtual keys via LiteLLM's key-management 
+API, scoped per namespace.
+
+TASK 5 — Autoscaling and disruption safety
+Install/configure prometheus-adapter to expose per-pod in-flight-
+request count as a custom metric, and add an HPA per model Deployment 
+scaling on that metric (not raw CPU%). Add a PodDisruptionBudget per 
+model ensuring at least 1 replica stays up during voluntary 
+disruptions (node drains, upgrades).
+
+TASK 6 — Observability
+Deploy Prometheus + Grafana + prometheus-adapter in the monitoring 
+namespace (assume Prometheus Operator available). Add ServiceMonitor 
+resources scraping each model pod's /metrics endpoint (latency, queue 
+depth, tokens/sec) across both inference-staging and 
+inference-production. Add a starter Grafana dashboard JSON under 
+/docs/architecture/dashboards/ that can filter by namespace/environment.
+
+TASK 7 — Docs
+Write /docs/architecture/inference-service.md with a Mermaid diagram 
+of the full request path (Client → Ingress → LiteLLM router → per-
+model Services → pods on labeled nodes, with MinIO weight store in 
+platform-storage and Prometheus/Grafana in monitoring as side 
+systems), a namespace/component table (Namespace | Contains | 
+Purpose), and a "known gaps" section you update as you close items 
+above.
+
+Work through the tasks in order. After each task, run kubectl 
+--dry-run=client -o yaml against new manifests to validate them before 
+moving on, and stop to ask me before applying anything to a real 
+cluster context.
